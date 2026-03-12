@@ -5,11 +5,19 @@
   const DEFAULT_HEIGHT = 600;
   const DEFAULT_TITLE = "Embedded content";
 
+  const DEBOUNCE_MS = 200;
+  const CALC_RETRY_COUNT = 8;
+  const CALC_RETRY_DELAY_MS = 250;
+
   const statusEl = document.getElementById("status");
   const frameEl = document.getElementById("embeddedFrame");
   const debugLogEl = document.getElementById("debugLog");
 
   let widgetStarted = false;
+
+  function sleep(ms) {
+    return new Promise((resolve) => window.setTimeout(resolve, ms));
+  }
 
   function writeDebug(label, value) {
     const line = `[${new Date().toISOString()}] ${label}: ${
@@ -142,6 +150,8 @@
       candidates.add(`#middle_${fieldId}`);
       candidates.add(`phone_${fieldId}`);
       candidates.add(`#phone_${fieldId}`);
+      candidates.add(`full_${fieldId}`);
+      candidates.add(`#full_${fieldId}`);
     }
 
     return [...candidates].filter(Boolean);
@@ -217,7 +227,11 @@
   function extractValueFromResponsePayload(payload) {
     if (payload == null) return "";
 
-    if (typeof payload === "string" || typeof payload === "number" || typeof payload === "boolean") {
+    if (
+      typeof payload === "string" ||
+      typeof payload === "number" ||
+      typeof payload === "boolean"
+    ) {
       return String(payload);
     }
 
@@ -268,7 +282,10 @@
           return String(el.value);
         }
 
-        if (typeof el.textContent !== "undefined" && String(el.textContent).trim() !== "") {
+        if (
+          typeof el.textContent !== "undefined" &&
+          String(el.textContent).trim() !== ""
+        ) {
           return String(el.textContent).trim();
         }
       } catch (error) {
@@ -291,7 +308,6 @@
 
       const candidates = buildCandidateNames(token);
       let resolved = false;
-      let attempted = 0;
 
       const finish = (value, meta = {}) => {
         if (resolved) return;
@@ -322,12 +338,10 @@
           source: domValue ? "domFallback" : "timeout",
           candidates,
         });
-      }, 400);
+      }, 450);
 
       candidates.forEach((candidate) => {
         ["input", "change", "blur", "ready"].forEach((eventName) => {
-          attempted += 1;
-
           try {
             window.JFCustomWidget.listenFromField(candidate, eventName, (payload) => {
               maybeFinishFromPayload(candidate, eventName, payload);
@@ -341,12 +355,6 @@
             });
           }
         });
-      });
-
-      writeDebug("directLookupAttempted", {
-        token,
-        candidates,
-        attempted,
       });
 
       Promise.resolve().then(() => {
@@ -373,11 +381,33 @@
     return values;
   }
 
+  function responseDataToValues(responseData, fieldIds) {
+    if (!Array.isArray(responseData)) {
+      return fieldIds.map(() => "");
+    }
+
+    const bySelector = new Map();
+
+    responseData.forEach((item) => {
+      const selector = String(item?.selector ?? "");
+      const value = item?.value ?? "";
+      bySelector.set(selector, String(value));
+    });
+
+    return fieldIds.map((fieldId) => bySelector.get(String(fieldId)) ?? "");
+  }
+
+  function hasAnyValue(values) {
+    return values.some((value) => String(value || "").trim() !== "");
+  }
+
   class ParameterIframeWidget {
     constructor() {
       this.settings = normalizeSettings(getWidgetSettings());
       this.tokens = extractTokens(this.settings.urlTemplate);
       this.fieldIds = this.tokens.map(getFieldIdFromToken).filter(Boolean);
+      this.updateSequence = 0;
+      this.updateTimer = null;
 
       writeDebug("normalizedSettings", this.settings);
       writeDebug("tokens", this.tokens);
@@ -396,6 +426,15 @@
       this.updateFrame();
     }
 
+    scheduleUpdate(reason = "unknown") {
+      window.clearTimeout(this.updateTimer);
+      writeDebug("scheduleUpdate", { reason, delay: DEBOUNCE_MS });
+
+      this.updateTimer = window.setTimeout(() => {
+        this.updateFrame();
+      }, DEBOUNCE_MS);
+    }
+
     bindFieldListeners() {
       if (
         typeof window.JFCustomWidget === "undefined" ||
@@ -409,27 +448,99 @@
         const candidates = buildCandidateNames(token);
 
         candidates.forEach((candidate) => {
-          try {
-            window.JFCustomWidget.listenFromField(candidate, "change", () => {
-              writeDebug("fieldChange", { token, candidate });
-              this.updateFrame();
-            });
-            writeDebug("listenerBound", { token, candidate, event: "change" });
-          } catch (error) {
-            writeDebug("listenerBindError", {
-              token,
-              candidate,
-              error: String(error),
-            });
-          }
+          ["change", "input", "blur"].forEach((eventName) => {
+            try {
+              window.JFCustomWidget.listenFromField(candidate, eventName, () => {
+                writeDebug("fieldEvent", { token, candidate, eventName });
+                this.scheduleUpdate(`${candidate}:${eventName}`);
+              });
+              writeDebug("listenerBound", { token, candidate, event: eventName });
+            } catch (error) {
+              writeDebug("listenerBindError", {
+                token,
+                candidate,
+                eventName,
+                error: String(error),
+              });
+            }
+          });
         });
       });
     }
 
+    async collectValuesWithRetries(currentSequence) {
+      let latestValues = this.fieldIds.map(() => "");
+
+      for (let attempt = 0; attempt <= CALC_RETRY_COUNT; attempt += 1) {
+        if (currentSequence !== this.updateSequence) {
+          writeDebug("staleCollectAborted", { currentSequence, attempt });
+          return null;
+        }
+
+        const response = await new Promise((resolve) => {
+          try {
+            window.JFCustomWidget.getFieldsValueById(this.fieldIds, resolve);
+          } catch (error) {
+            writeDebug("getFieldsValueByIdError", {
+              currentSequence,
+              attempt,
+              error: String(error),
+            });
+            resolve(null);
+          }
+        });
+
+        if (currentSequence !== this.updateSequence) {
+          writeDebug("stalePrimaryResponseIgnored", { currentSequence, attempt });
+          return null;
+        }
+
+        writeDebug("rawFieldResponse", { attempt, response });
+
+        latestValues = responseDataToValues(response?.data, this.fieldIds);
+        writeDebug("prefillsInOrder", { attempt, values: latestValues });
+
+        const emptyIndexes = latestValues
+          .map((value, index) => ({
+            index,
+            token: this.tokens[index],
+            fieldId: this.fieldIds[index],
+            value,
+          }))
+          .filter((entry) => String(entry.value || "").trim() === "");
+
+        if (emptyIndexes.length === 0) {
+          writeDebug("retryComplete", {
+            reason: "all_fields_filled",
+            attempt,
+            values: latestValues,
+          });
+          return latestValues;
+        }
+
+        if (attempt < CALC_RETRY_COUNT) {
+          writeDebug("retryWaitingForCalculatedFields", {
+            attempt,
+            emptyFields: emptyIndexes,
+            waitMs: CALC_RETRY_DELAY_MS,
+          });
+          await sleep(CALC_RETRY_DELAY_MS);
+        }
+      }
+
+      writeDebug("retryExhausted", { values: latestValues });
+      return latestValues;
+    }
+
     async updateFrame() {
+      const currentSequence = ++this.updateSequence;
+      writeDebug("updateFrameStart", { currentSequence });
+
       if (!this.tokens.length) {
         writeDebug("noTokens", "Using URL as-is");
-        this.setFrameSource(this.settings.urlTemplate);
+        if (currentSequence === this.updateSequence) {
+          this.setFrameSource(this.settings.urlTemplate);
+        }
         return;
       }
 
@@ -447,47 +558,60 @@
         writeDebug("standalonePreviewValues", previewValues);
         writeDebug("standalonePreviewUrl", previewUrl);
 
-        this.setFrameSource(previewUrl);
+        if (currentSequence === this.updateSequence) {
+          this.setFrameSource(previewUrl);
+        }
         return;
       }
 
       try {
-        writeDebug("requestFieldValuesById", this.fieldIds);
+        writeDebug("requestFieldValuesById", {
+          currentSequence,
+          fieldIds: this.fieldIds,
+        });
 
-        window.JFCustomWidget.getFieldsValueById(this.fieldIds, async (response) => {
-          writeDebug("rawFieldResponse", response);
+        let prefills = await this.collectValuesWithRetries(currentSequence);
+        if (prefills == null) return;
 
-          let prefills = Array.isArray(response?.data)
-            ? response.data.map((item) => item?.value ?? "")
-            : [];
+        const hasValuesFromPrimary = hasAnyValue(prefills);
 
-          writeDebug("prefillsInOrder", prefills);
-
-          const hasAnyValues = prefills.some((value) => String(value || "").trim() !== "");
-
-          if (!hasAnyValues) {
-            writeDebug("fallbackMode", "getFieldsValueById returned empty; trying direct token lookup");
-            prefills = await getDirectTokenValues(this.tokens);
-            writeDebug("prefillsFromDirectLookup", prefills);
-          }
-
-          const tokenValuePairs = this.tokens.map((token, index) => ({
-            token,
-            fieldId: this.fieldIds[index] ?? null,
-            value: prefills[index] ?? "",
-          }));
-
-          writeDebug("tokenValuePairs", tokenValuePairs);
-
-          const finalUrl = replaceTokensInOrder(
-            this.settings.urlTemplate,
-            this.tokens,
-            prefills
+        if (!hasValuesFromPrimary) {
+          writeDebug(
+            "fallbackMode",
+            "Primary lookup empty after retries; trying direct token lookup"
           );
 
-          writeDebug("finalUrl", finalUrl);
+          prefills = await getDirectTokenValues(this.tokens);
+
+          if (currentSequence !== this.updateSequence) {
+            writeDebug("staleFallbackResponseIgnored", { currentSequence });
+            return;
+          }
+
+          writeDebug("prefillsFromDirectLookup", prefills);
+        }
+
+        const tokenValuePairs = this.tokens.map((token, index) => ({
+          token,
+          fieldId: this.fieldIds[index] ?? null,
+          value: prefills[index] ?? "",
+        }));
+
+        writeDebug("tokenValuePairs", tokenValuePairs);
+
+        const finalUrl = replaceTokensInOrder(
+          this.settings.urlTemplate,
+          this.tokens,
+          prefills
+        );
+
+        writeDebug("finalUrl", finalUrl);
+
+        if (currentSequence === this.updateSequence) {
           this.setFrameSource(finalUrl);
-        });
+        } else {
+          writeDebug("staleFinalUrlIgnored", { currentSequence, finalUrl });
+        }
       } catch (error) {
         console.error("Failed to read Jotform field values:", error);
         writeDebug("updateFrameError", String(error));
