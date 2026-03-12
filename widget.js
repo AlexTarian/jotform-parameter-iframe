@@ -166,15 +166,6 @@ function buildTokenValueMap(tokens, resultData) {
   return finalMap;
 }
 
-    const finalMap = {};
-    for (const token of tokens) {
-      const fieldId = getFieldIdFromToken(token);
-      finalMap[token] = fieldId ? (valuesById.get(fieldId) || "") : "";
-    }
-
-    return finalMap;
-  }
-
   function replaceTokens(template, tokenValues) {
     return template.replace(TOKEN_REGEX, (_, tokenName) => {
       const rawValue = tokenValues[tokenName] ?? "";
