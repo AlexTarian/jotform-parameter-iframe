@@ -97,9 +97,15 @@
   function getFieldIdFromToken(token) {
     const trimmed = String(token).trim();
 
+    // Matches q123_something
     const qMatch = trimmed.match(/^q(\d+)(?:_|$)/i);
     if (qMatch) return qMatch[1];
 
+    // Matches #input_165, #first_3, #last_3, etc.
+    const hashMatch = trimmed.match(/^#?[a-zA-Z]+_(\d+)$/);
+    if (hashMatch) return hashMatch[1];
+
+    // Matches plain numeric token: 165
     const numericMatch = trimmed.match(/^(\d+)$/);
     if (numericMatch) return numericMatch[1];
 
@@ -113,47 +119,52 @@
 
     return [...new Set(ids)];
   }
+  
+function getPreviewFieldValues(tokens) {
+  const params = new URLSearchParams(window.location.search);
+  const values = {};
 
-  function getPreviewFieldValues(tokens) {
-    const params = new URLSearchParams(window.location.search);
-    const values = {};
+  for (const token of tokens) {
+    const fieldId = getFieldIdFromToken(token);
 
-    for (const token of tokens) {
-      const fieldId = getFieldIdFromToken(token);
-
-      if (!fieldId) {
-        values[token] = "";
-        continue;
-      }
-
-      values[token] =
-        params.get(token) ??
-        params.get(`q${fieldId}`) ??
-        params.get(`field_${fieldId}`) ??
-        "";
-    }
-
-    return values;
+    values[token] =
+      params.get(token) ??
+      params.get(token.replace(/^#/, "")) ??
+      (fieldId ? params.get(fieldId) : null) ??
+      (fieldId ? params.get(`q${fieldId}`) : null) ??
+      "";
   }
 
-  function buildTokenValueMap(tokens, resultData) {
-    const valuesById = new Map();
+  return values;
+}
 
-    if (Array.isArray(resultData)) {
-      for (const item of resultData) {
-        if (!item) continue;
+function buildTokenValueMap(tokens, resultData) {
+  const valuesById = new Map();
 
-        const rawId = item.id ?? item.qid ?? item.fieldId ?? item.name;
-        const value = item.value ?? "";
+  if (Array.isArray(resultData)) {
+    for (const item of resultData) {
+      if (!item) continue;
 
-        if (rawId !== undefined && rawId !== null) {
-          const numeric = String(rawId).replace(/[^\d]/g, "");
-          if (numeric) {
-            valuesById.set(numeric, String(value));
-          }
+      const rawId = item.id ?? item.qid ?? item.fieldId ?? item.name;
+      const value = item.value ?? "";
+
+      if (rawId !== undefined && rawId !== null) {
+        const numeric = String(rawId).match(/\d+/);
+        if (numeric) {
+          valuesById.set(numeric[0], String(value));
         }
       }
     }
+  }
+
+  const finalMap = {};
+  for (const token of tokens) {
+    const fieldId = getFieldIdFromToken(token);
+    finalMap[token] = fieldId ? (valuesById.get(fieldId) || "") : "";
+  }
+
+  return finalMap;
+}
 
     const finalMap = {};
     for (const token of tokens) {
@@ -223,24 +234,36 @@
       this.updateFrame();
     }
 
-    bindFieldListeners() {
-      if (
-        typeof window.JFCustomWidget === "undefined" ||
-        typeof window.JFCustomWidget.listenFromField !== "function"
-      ) {
-        return;
-      }
+bindFieldListeners() {
+  if (
+    typeof window.JFCustomWidget === "undefined" ||
+    typeof window.JFCustomWidget.listenFromField !== "function"
+  ) {
+    return;
+  }
 
-      for (const token of this.tokens) {
-        try {
-          window.JFCustomWidget.listenFromField(token, "change", () => {
-            this.updateFrame();
-          });
-        } catch (error) {
-          console.warn(`Could not listen to field token "${token}":`, error);
-        }
+  for (const token of this.tokens) {
+    const fieldId = getFieldIdFromToken(token);
+    if (!fieldId) continue;
+
+    const candidates = [
+      token,
+      token.replace(/^#/, ""),
+      `q${fieldId}`,
+      fieldId
+    ];
+
+    for (const candidate of candidates) {
+      try {
+        window.JFCustomWidget.listenFromField(candidate, "change", () => {
+          this.updateFrame();
+        });
+      } catch (error) {
+        // Quietly try the next format
       }
     }
+  }
+}
 
     updateFrame() {
       if (!this.tokens.length) {
