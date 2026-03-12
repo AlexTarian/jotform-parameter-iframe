@@ -123,6 +123,30 @@
     return null;
   }
 
+  function buildCandidateNames(token) {
+    const trimmed = String(token).trim();
+    const fieldId = getFieldIdFromToken(trimmed);
+    const withoutHash = trimmed.replace(/^#/, "");
+    const candidates = new Set([trimmed, withoutHash]);
+
+    if (fieldId) {
+      candidates.add(fieldId);
+      candidates.add(`q${fieldId}`);
+      candidates.add(`input_${fieldId}`);
+      candidates.add(`#input_${fieldId}`);
+      candidates.add(`first_${fieldId}`);
+      candidates.add(`#first_${fieldId}`);
+      candidates.add(`last_${fieldId}`);
+      candidates.add(`#last_${fieldId}`);
+      candidates.add(`middle_${fieldId}`);
+      candidates.add(`#middle_${fieldId}`);
+      candidates.add(`phone_${fieldId}`);
+      candidates.add(`#phone_${fieldId}`);
+    }
+
+    return [...candidates].filter(Boolean);
+  }
+
   function replaceTokensInOrder(template, tokens, values) {
     let fullURL = template;
 
@@ -169,6 +193,186 @@
     }
   }
 
+  function getStandalonePreviewValues(tokens) {
+    const params = new URLSearchParams(window.location.search);
+    const values = [];
+
+    for (const token of tokens) {
+      const candidates = buildCandidateNames(token);
+      let found = "";
+
+      for (const candidate of candidates) {
+        if (params.has(candidate)) {
+          found = params.get(candidate) || "";
+          break;
+        }
+      }
+
+      values.push(found);
+    }
+
+    return values;
+  }
+
+  function extractValueFromResponsePayload(payload) {
+    if (payload == null) return "";
+
+    if (typeof payload === "string" || typeof payload === "number" || typeof payload === "boolean") {
+      return String(payload);
+    }
+
+    if (Array.isArray(payload)) {
+      return payload
+        .map((item) => extractValueFromResponsePayload(item))
+        .filter(Boolean)
+        .join(" ");
+    }
+
+    if (typeof payload === "object") {
+      if (typeof payload.value !== "undefined") {
+        return extractValueFromResponsePayload(payload.value);
+      }
+
+      if (typeof payload.data !== "undefined") {
+        return extractValueFromResponsePayload(payload.data);
+      }
+
+      if (typeof payload.text !== "undefined") {
+        return extractValueFromResponsePayload(payload.text);
+      }
+
+      if (typeof payload.answer !== "undefined") {
+        return extractValueFromResponsePayload(payload.answer);
+      }
+    }
+
+    return "";
+  }
+
+  function getValueFromDomFallback(token) {
+    const candidates = buildCandidateNames(token);
+    const selectors = [];
+
+    for (const candidate of candidates) {
+      selectors.push(`[name="${candidate}"]`);
+      selectors.push(`#${candidate}`);
+      selectors.push(`[data-component="${candidate}"]`);
+    }
+
+    for (const selector of selectors) {
+      try {
+        const el = document.querySelector(selector);
+        if (!el) continue;
+
+        if (typeof el.value !== "undefined" && String(el.value).trim() !== "") {
+          return String(el.value);
+        }
+
+        if (typeof el.textContent !== "undefined" && String(el.textContent).trim() !== "") {
+          return String(el.textContent).trim();
+        }
+      } catch (error) {
+        // ignore invalid selectors
+      }
+    }
+
+    return "";
+  }
+
+  function getFieldValueFromListeners(token) {
+    return new Promise((resolve) => {
+      if (
+        typeof window.JFCustomWidget === "undefined" ||
+        typeof window.JFCustomWidget.listenFromField !== "function"
+      ) {
+        resolve(getValueFromDomFallback(token));
+        return;
+      }
+
+      const candidates = buildCandidateNames(token);
+      let resolved = false;
+      let attempted = 0;
+
+      const finish = (value, meta = {}) => {
+        if (resolved) return;
+        resolved = true;
+        writeDebug("directLookupResolved", {
+          token,
+          value,
+          ...meta,
+        });
+        resolve(String(value ?? ""));
+      };
+
+      const maybeFinishFromPayload = (candidate, eventName, payload) => {
+        const extracted = extractValueFromResponsePayload(payload);
+        if (extracted !== "") {
+          finish(extracted, {
+            candidate,
+            eventName,
+            source: "listener",
+            payload,
+          });
+        }
+      };
+
+      const timer = window.setTimeout(() => {
+        const domValue = getValueFromDomFallback(token);
+        finish(domValue, {
+          source: domValue ? "domFallback" : "timeout",
+          candidates,
+        });
+      }, 400);
+
+      candidates.forEach((candidate) => {
+        ["input", "change", "blur", "ready"].forEach((eventName) => {
+          attempted += 1;
+
+          try {
+            window.JFCustomWidget.listenFromField(candidate, eventName, (payload) => {
+              maybeFinishFromPayload(candidate, eventName, payload);
+            });
+          } catch (error) {
+            writeDebug("directLookupListenerError", {
+              token,
+              candidate,
+              eventName,
+              error: String(error),
+            });
+          }
+        });
+      });
+
+      writeDebug("directLookupAttempted", {
+        token,
+        candidates,
+        attempted,
+      });
+
+      Promise.resolve().then(() => {
+        const domValue = getValueFromDomFallback(token);
+        if (domValue) {
+          window.clearTimeout(timer);
+          finish(domValue, {
+            source: "domImmediate",
+            candidates,
+          });
+        }
+      });
+    });
+  }
+
+  async function getDirectTokenValues(tokens) {
+    const values = [];
+
+    for (const token of tokens) {
+      const value = await getFieldValueFromListeners(token);
+      values.push(value);
+    }
+
+    return values;
+  }
+
   class ParameterIframeWidget {
     constructor() {
       this.settings = normalizeSettings(getWidgetSettings());
@@ -202,19 +406,27 @@
       }
 
       this.tokens.forEach((token) => {
-        try {
-          window.JFCustomWidget.listenFromField(token, "change", () => {
-            writeDebug("fieldChange", token);
-            this.updateFrame();
-          });
-          writeDebug("listenerBound", token);
-        } catch (error) {
-          writeDebug("listenerBindError", { token, error: String(error) });
-        }
+        const candidates = buildCandidateNames(token);
+
+        candidates.forEach((candidate) => {
+          try {
+            window.JFCustomWidget.listenFromField(candidate, "change", () => {
+              writeDebug("fieldChange", { token, candidate });
+              this.updateFrame();
+            });
+            writeDebug("listenerBound", { token, candidate, event: "change" });
+          } catch (error) {
+            writeDebug("listenerBindError", {
+              token,
+              candidate,
+              error: String(error),
+            });
+          }
+        });
       });
     }
 
-    updateFrame() {
+    async updateFrame() {
       if (!this.tokens.length) {
         writeDebug("noTokens", "Using URL as-is");
         this.setFrameSource(this.settings.urlTemplate);
@@ -225,22 +437,39 @@
         typeof window.JFCustomWidget === "undefined" ||
         typeof window.JFCustomWidget.getFieldsValueById !== "function"
       ) {
-        writeDebug("getFieldsValueById", "Unavailable in standalone mode");
-        setStatus("Jotform field API is unavailable in standalone mode.", "warn");
+        const previewValues = getStandalonePreviewValues(this.tokens);
+        const previewUrl = replaceTokensInOrder(
+          this.settings.urlTemplate,
+          this.tokens,
+          previewValues
+        );
+
+        writeDebug("standalonePreviewValues", previewValues);
+        writeDebug("standalonePreviewUrl", previewUrl);
+
+        this.setFrameSource(previewUrl);
         return;
       }
 
       try {
         writeDebug("requestFieldValuesById", this.fieldIds);
 
-        window.JFCustomWidget.getFieldsValueById(this.fieldIds, (response) => {
+        window.JFCustomWidget.getFieldsValueById(this.fieldIds, async (response) => {
           writeDebug("rawFieldResponse", response);
 
-          const prefills = Array.isArray(response?.data)
+          let prefills = Array.isArray(response?.data)
             ? response.data.map((item) => item?.value ?? "")
             : [];
 
           writeDebug("prefillsInOrder", prefills);
+
+          const hasAnyValues = prefills.some((value) => String(value || "").trim() !== "");
+
+          if (!hasAnyValues) {
+            writeDebug("fallbackMode", "getFieldsValueById returned empty; trying direct token lookup");
+            prefills = await getDirectTokenValues(this.tokens);
+            writeDebug("prefillsFromDirectLookup", prefills);
+          }
 
           const tokenValuePairs = this.tokens.map((token, index) => ({
             token,
