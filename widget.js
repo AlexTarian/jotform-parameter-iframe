@@ -7,13 +7,33 @@
 
   const statusEl = document.getElementById("status");
   const frameEl = document.getElementById("embeddedFrame");
+  const debugLogEl = document.getElementById("debugLog");
 
   let widgetStarted = false;
+
+  function writeDebug(label, value) {
+    const line = `[${new Date().toISOString()}] ${label}: ${
+      typeof value === "string" ? value : JSON.stringify(value, null, 2)
+    }`;
+
+    console.log(line);
+
+    if (debugLogEl) {
+      debugLogEl.textContent += `\n${line}`;
+    }
+  }
+
+  function resetDebug() {
+    if (debugLogEl) {
+      debugLogEl.textContent = "Widget booting...";
+    }
+  }
 
   function setStatus(message, type = "info") {
     if (!statusEl) return;
     statusEl.textContent = message;
     statusEl.className = `status status--${type} is-visible`;
+    writeDebug("status", { type, message });
   }
 
   function clearStatus() {
@@ -41,15 +61,19 @@
       typeof window.JFCustomWidget.getWidgetSettings === "function"
     ) {
       try {
-        return {
+        const merged = {
           ...querySettings,
           ...window.JFCustomWidget.getWidgetSettings(),
         };
+        writeDebug("widgetSettings", merged);
+        return merged;
       } catch (error) {
         console.warn("Could not read Jotform widget settings:", error);
+        writeDebug("widgetSettingsError", String(error));
       }
     }
 
+    writeDebug("querySettingsOnly", querySettings);
     return querySettings;
   }
 
@@ -59,7 +83,6 @@
     const iframeHeight = normalizeHeight(
       raw.iframeHeight || raw.height || raw.frameHeight
     );
-
     const sandbox =
       typeof raw.iframeSandbox === "string" ? raw.iframeSandbox.trim() : "";
 
@@ -86,11 +109,13 @@
   function getFieldIdFromToken(token) {
     const trimmed = String(token).trim();
 
+    const splitParts = trimmed.split("_");
+    if (splitParts.length > 1 && /^\d+$/.test(splitParts[1])) {
+      return splitParts[1];
+    }
+
     const qMatch = trimmed.match(/^q(\d+)(?:_|$)/i);
     if (qMatch) return qMatch[1];
-
-    const hashMatch = trimmed.match(/^#?[a-zA-Z]+_(\d+)$/);
-    if (hashMatch) return hashMatch[1];
 
     const numericMatch = trimmed.match(/^(\d+)$/);
     if (numericMatch) return numericMatch[1];
@@ -98,62 +123,15 @@
     return null;
   }
 
-  function getUniqueFieldIds(tokens) {
-    const ids = tokens.map(getFieldIdFromToken).filter(Boolean);
-    return [...new Set(ids)];
-  }
+  function replaceTokensInOrder(template, tokens, values) {
+    let fullURL = template;
 
-  function getPreviewFieldValues(tokens) {
-    const params = new URLSearchParams(window.location.search);
-    const values = {};
-
-    for (const token of tokens) {
-      const fieldId = getFieldIdFromToken(token);
-
-      values[token] =
-        params.get(token) ??
-        params.get(token.replace(/^#/, "")) ??
-        (fieldId ? params.get(fieldId) : null) ??
-        (fieldId ? params.get(`q${fieldId}`) : null) ??
-        "";
-    }
-
-    return values;
-  }
-
-  function buildTokenValueMap(tokens, resultData) {
-    const valuesById = new Map();
-
-    if (Array.isArray(resultData)) {
-      for (const item of resultData) {
-        if (!item) continue;
-
-        const rawId = item.id ?? item.qid ?? item.fieldId ?? item.name;
-        const value = item.value ?? "";
-
-        if (rawId !== undefined && rawId !== null) {
-          const numeric = String(rawId).match(/\d+/);
-          if (numeric) {
-            valuesById.set(numeric[0], String(value));
-          }
-        }
-      }
-    }
-
-    const finalMap = {};
-    for (const token of tokens) {
-      const fieldId = getFieldIdFromToken(token);
-      finalMap[token] = fieldId ? valuesById.get(fieldId) || "" : "";
-    }
-
-    return finalMap;
-  }
-
-  function replaceTokens(template, tokenValues) {
-    return template.replace(TOKEN_REGEX, (_, tokenName) => {
-      const rawValue = tokenValues[tokenName] ?? "";
-      return encodeURIComponent(String(rawValue));
+    tokens.forEach((token, index) => {
+      const rawValue = values[index] ?? "";
+      fullURL = fullURL.replace(`{${token}}`, encodeURIComponent(String(rawValue)));
     });
+
+    return fullURL;
   }
 
   function isSafeHttpUrl(value) {
@@ -186,7 +164,7 @@
           height: settings.iframeHeight + 16,
         });
       } catch (error) {
-        console.warn("Frame resize request failed:", error);
+        writeDebug("requestFrameResizeError", String(error));
       }
     }
   }
@@ -195,7 +173,11 @@
     constructor() {
       this.settings = normalizeSettings(getWidgetSettings());
       this.tokens = extractTokens(this.settings.urlTemplate);
-      this.fieldIds = getUniqueFieldIds(this.tokens);
+      this.fieldIds = this.tokens.map(getFieldIdFromToken).filter(Boolean);
+
+      writeDebug("normalizedSettings", this.settings);
+      writeDebug("tokens", this.tokens);
+      writeDebug("fieldIds", this.fieldIds);
     }
 
     init() {
@@ -215,34 +197,26 @@
         typeof window.JFCustomWidget === "undefined" ||
         typeof window.JFCustomWidget.listenFromField !== "function"
       ) {
+        writeDebug("bindFieldListeners", "JFCustomWidget.listenFromField unavailable");
         return;
       }
 
-      for (const token of this.tokens) {
-        const fieldId = getFieldIdFromToken(token);
-        if (!fieldId) continue;
-
-        const candidates = [
-          token,
-          token.replace(/^#/, ""),
-          `q${fieldId}`,
-          fieldId,
-        ];
-
-        for (const candidate of candidates) {
-          try {
-            window.JFCustomWidget.listenFromField(candidate, "change", () => {
-              this.updateFrame();
-            });
-          } catch (error) {
-            // Try the next candidate format
-          }
+      this.tokens.forEach((token) => {
+        try {
+          window.JFCustomWidget.listenFromField(token, "change", () => {
+            writeDebug("fieldChange", token);
+            this.updateFrame();
+          });
+          writeDebug("listenerBound", token);
+        } catch (error) {
+          writeDebug("listenerBindError", { token, error: String(error) });
         }
-      }
+      });
     }
 
     updateFrame() {
       if (!this.tokens.length) {
+        writeDebug("noTokens", "Using URL as-is");
         this.setFrameSource(this.settings.urlTemplate);
         return;
       }
@@ -251,20 +225,43 @@
         typeof window.JFCustomWidget === "undefined" ||
         typeof window.JFCustomWidget.getFieldsValueById !== "function"
       ) {
-        const previewValues = getPreviewFieldValues(this.tokens);
-        const previewUrl = replaceTokens(this.settings.urlTemplate, previewValues);
-        this.setFrameSource(previewUrl);
+        writeDebug("getFieldsValueById", "Unavailable in standalone mode");
+        setStatus("Jotform field API is unavailable in standalone mode.", "warn");
         return;
       }
 
       try {
+        writeDebug("requestFieldValuesById", this.fieldIds);
+
         window.JFCustomWidget.getFieldsValueById(this.fieldIds, (response) => {
-          const tokenValues = buildTokenValueMap(this.tokens, response?.data);
-          const finalUrl = replaceTokens(this.settings.urlTemplate, tokenValues);
+          writeDebug("rawFieldResponse", response);
+
+          const prefills = Array.isArray(response?.data)
+            ? response.data.map((item) => item?.value ?? "")
+            : [];
+
+          writeDebug("prefillsInOrder", prefills);
+
+          const tokenValuePairs = this.tokens.map((token, index) => ({
+            token,
+            fieldId: this.fieldIds[index] ?? null,
+            value: prefills[index] ?? "",
+          }));
+
+          writeDebug("tokenValuePairs", tokenValuePairs);
+
+          const finalUrl = replaceTokensInOrder(
+            this.settings.urlTemplate,
+            this.tokens,
+            prefills
+          );
+
+          writeDebug("finalUrl", finalUrl);
           this.setFrameSource(finalUrl);
         });
       } catch (error) {
         console.error("Failed to read Jotform field values:", error);
+        writeDebug("updateFrameError", String(error));
         setStatus("Could not read Jotform field values.", "error");
       }
     }
@@ -291,17 +288,16 @@
 
       clearStatus();
       frameEl.src = trimmed;
+      writeDebug("iframeSrcSet", trimmed);
 
       if (
         typeof window.JFCustomWidget !== "undefined" &&
         typeof window.JFCustomWidget.sendData === "function"
       ) {
         try {
-          window.JFCustomWidget.sendData({
-            value: trimmed,
-          });
+          window.JFCustomWidget.sendData({ value: trimmed });
         } catch (error) {
-          console.warn("Could not send widget data back to Jotform:", error);
+          writeDebug("sendDataError", String(error));
         }
       }
     }
@@ -310,6 +306,8 @@
   function startWidget() {
     if (widgetStarted) return;
     widgetStarted = true;
+    resetDebug();
+    writeDebug("startup", "Starting widget");
 
     const widget = new ParameterIframeWidget();
     widget.init();
@@ -330,14 +328,16 @@
     ) {
       try {
         window.JFCustomWidget.subscribe("ready", () => {
+          writeDebug("readyEvent", "JFCustomWidget ready fired");
           safeStart();
         });
       } catch (error) {
-        console.warn("JFCustomWidget ready subscription failed:", error);
+        writeDebug("readySubscribeError", String(error));
       }
     }
 
     window.setTimeout(() => {
+      writeDebug("readyFallback", "Timeout fallback fired");
       safeStart();
     }, 500);
   });
