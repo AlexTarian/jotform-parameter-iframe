@@ -305,7 +305,6 @@
       }
     }
   }
-
   function startWidget() {
     if (widgetStarted) return;
     widgetStarted = true;
@@ -315,15 +314,30 @@
   }
 
   document.addEventListener("DOMContentLoaded", () => {
+    let readyTriggered = false;
+
+    const safeStart = () => {
+      if (readyTriggered) return;
+      readyTriggered = true;
+      startWidget();
+    };
+
     if (
       typeof window.JFCustomWidget !== "undefined" &&
       typeof window.JFCustomWidget.subscribe === "function"
     ) {
-      window.JFCustomWidget.subscribe("ready", () => {
-        startWidget();
-      });
-    } else {
-      startWidget();
+      try {
+        window.JFCustomWidget.subscribe("ready", () => {
+          safeStart();
+        });
+      } catch (error) {
+        console.warn("JFCustomWidget ready subscription failed:", error);
+      }
     }
+
+    // Fallback for standalone GitHub Pages testing
+    window.setTimeout(() => {
+      safeStart();
+    }, 500);
   });
 })();
