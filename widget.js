@@ -12,7 +12,6 @@
 
   function setStatus(message, type = "info") {
     if (!statusEl) return;
-
     statusEl.textContent = message;
     statusEl.className = `status status--${type} is-visible`;
   }
@@ -55,24 +54,14 @@
   }
 
   function normalizeSettings(raw) {
-    const urlTemplate =
-      raw.urlTemplate ||
-      raw.URL ||
-      raw.url ||
-      "";
-
-    const iframeTitle =
-      raw.iframeTitle ||
-      raw.title ||
-      DEFAULT_TITLE;
-
+    const urlTemplate = raw.urlTemplate || raw.URL || raw.url || "";
+    const iframeTitle = raw.iframeTitle || raw.title || DEFAULT_TITLE;
     const iframeHeight = normalizeHeight(
       raw.iframeHeight || raw.height || raw.frameHeight
     );
 
-    const sandbox = typeof raw.iframeSandbox === "string"
-      ? raw.iframeSandbox.trim()
-      : "";
+    const sandbox =
+      typeof raw.iframeSandbox === "string" ? raw.iframeSandbox.trim() : "";
 
     return {
       urlTemplate: String(urlTemplate).trim(),
@@ -97,15 +86,12 @@
   function getFieldIdFromToken(token) {
     const trimmed = String(token).trim();
 
-    // Matches q123_something
     const qMatch = trimmed.match(/^q(\d+)(?:_|$)/i);
     if (qMatch) return qMatch[1];
 
-    // Matches #input_165, #first_3, #last_3, etc.
     const hashMatch = trimmed.match(/^#?[a-zA-Z]+_(\d+)$/);
     if (hashMatch) return hashMatch[1];
 
-    // Matches plain numeric token: 165
     const numericMatch = trimmed.match(/^(\d+)$/);
     if (numericMatch) return numericMatch[1];
 
@@ -113,58 +99,55 @@
   }
 
   function getUniqueFieldIds(tokens) {
-    const ids = tokens
-      .map(getFieldIdFromToken)
-      .filter(Boolean);
-
+    const ids = tokens.map(getFieldIdFromToken).filter(Boolean);
     return [...new Set(ids)];
   }
-  
-function getPreviewFieldValues(tokens) {
-  const params = new URLSearchParams(window.location.search);
-  const values = {};
 
-  for (const token of tokens) {
-    const fieldId = getFieldIdFromToken(token);
+  function getPreviewFieldValues(tokens) {
+    const params = new URLSearchParams(window.location.search);
+    const values = {};
 
-    values[token] =
-      params.get(token) ??
-      params.get(token.replace(/^#/, "")) ??
-      (fieldId ? params.get(fieldId) : null) ??
-      (fieldId ? params.get(`q${fieldId}`) : null) ??
-      "";
+    for (const token of tokens) {
+      const fieldId = getFieldIdFromToken(token);
+
+      values[token] =
+        params.get(token) ??
+        params.get(token.replace(/^#/, "")) ??
+        (fieldId ? params.get(fieldId) : null) ??
+        (fieldId ? params.get(`q${fieldId}`) : null) ??
+        "";
+    }
+
+    return values;
   }
 
-  return values;
-}
+  function buildTokenValueMap(tokens, resultData) {
+    const valuesById = new Map();
 
-function buildTokenValueMap(tokens, resultData) {
-  const valuesById = new Map();
+    if (Array.isArray(resultData)) {
+      for (const item of resultData) {
+        if (!item) continue;
 
-  if (Array.isArray(resultData)) {
-    for (const item of resultData) {
-      if (!item) continue;
+        const rawId = item.id ?? item.qid ?? item.fieldId ?? item.name;
+        const value = item.value ?? "";
 
-      const rawId = item.id ?? item.qid ?? item.fieldId ?? item.name;
-      const value = item.value ?? "";
-
-      if (rawId !== undefined && rawId !== null) {
-        const numeric = String(rawId).match(/\d+/);
-        if (numeric) {
-          valuesById.set(numeric[0], String(value));
+        if (rawId !== undefined && rawId !== null) {
+          const numeric = String(rawId).match(/\d+/);
+          if (numeric) {
+            valuesById.set(numeric[0], String(value));
+          }
         }
       }
     }
-  }
 
-  const finalMap = {};
-  for (const token of tokens) {
-    const fieldId = getFieldIdFromToken(token);
-    finalMap[token] = fieldId ? (valuesById.get(fieldId) || "") : "";
-  }
+    const finalMap = {};
+    for (const token of tokens) {
+      const fieldId = getFieldIdFromToken(token);
+      finalMap[token] = fieldId ? valuesById.get(fieldId) || "" : "";
+    }
 
-  return finalMap;
-}
+    return finalMap;
+  }
 
   function replaceTokens(template, tokenValues) {
     return template.replace(TOKEN_REGEX, (_, tokenName) => {
@@ -183,6 +166,8 @@ function buildTokenValueMap(tokens, resultData) {
   }
 
   function applyFrameSettings(settings) {
+    if (!frameEl) return;
+
     frameEl.style.height = `${settings.iframeHeight}px`;
     frameEl.title = settings.iframeTitle;
 
@@ -225,36 +210,36 @@ function buildTokenValueMap(tokens, resultData) {
       this.updateFrame();
     }
 
-bindFieldListeners() {
-  if (
-    typeof window.JFCustomWidget === "undefined" ||
-    typeof window.JFCustomWidget.listenFromField !== "function"
-  ) {
-    return;
-  }
+    bindFieldListeners() {
+      if (
+        typeof window.JFCustomWidget === "undefined" ||
+        typeof window.JFCustomWidget.listenFromField !== "function"
+      ) {
+        return;
+      }
 
-  for (const token of this.tokens) {
-    const fieldId = getFieldIdFromToken(token);
-    if (!fieldId) continue;
+      for (const token of this.tokens) {
+        const fieldId = getFieldIdFromToken(token);
+        if (!fieldId) continue;
 
-    const candidates = [
-      token,
-      token.replace(/^#/, ""),
-      `q${fieldId}`,
-      fieldId
-    ];
+        const candidates = [
+          token,
+          token.replace(/^#/, ""),
+          `q${fieldId}`,
+          fieldId,
+        ];
 
-    for (const candidate of candidates) {
-      try {
-        window.JFCustomWidget.listenFromField(candidate, "change", () => {
-          this.updateFrame();
-        });
-      } catch (error) {
-        // Quietly try the next format
+        for (const candidate of candidates) {
+          try {
+            window.JFCustomWidget.listenFromField(candidate, "change", () => {
+              this.updateFrame();
+            });
+          } catch (error) {
+            // Try the next candidate format
+          }
+        }
       }
     }
-  }
-}
 
     updateFrame() {
       if (!this.tokens.length) {
@@ -285,6 +270,8 @@ bindFieldListeners() {
     }
 
     setFrameSource(url) {
+      if (!frameEl) return;
+
       const trimmed = String(url || "").trim();
 
       if (!trimmed) {
@@ -319,6 +306,7 @@ bindFieldListeners() {
       }
     }
   }
+
   function startWidget() {
     if (widgetStarted) return;
     widgetStarted = true;
@@ -349,7 +337,6 @@ bindFieldListeners() {
       }
     }
 
-    // Fallback for standalone GitHub Pages testing
     window.setTimeout(() => {
       safeStart();
     }, 500);
